@@ -1,28 +1,20 @@
-import os, cv2, time, json, argparse, threading, asyncio, platform, glob
+# app2.py
+import os, re, cv2, time, json, argparse, threading, asyncio, platform, urllib.request
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
 
 from fastapi import FastAPI, Request, Query, HTTPException
-from fastapi.responses import StreamingResponse, Response, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 import uvicorn
+import numpy as np
 
 from ultralytics import YOLO
 from shapely.geometry import Point, Polygon
 from shapely.geometry import box as shapely_box
 from shapely.validation import make_valid
-
-# ---- face allowlist imports (ADDED) ----
-import numpy as np
-from insightface.app import FaceAnalysis
-
-# ---- optional (Windows) webcam name enumeration ----
-try:
-    from pygrabber.dshow_graph import FilterGraph  # pip install pygrabber
-except Exception:
-    FilterGraph = None
 
 # ---------------- FastAPI (create ONCE, then add CORS) ----------------
 app = FastAPI()
@@ -44,7 +36,7 @@ app.add_middleware(
 
 # ---------------- CLI ----------------
 def parse_args():
-    ap = argparse.ArgumentParser("Multi-camera backend (YOLO + zones) for React UI (with face allowlist)")
+    ap = argparse.ArgumentParser("Multi-camera backend (YOLO + zones + OpenCV face allowlist)")
     ap.add_argument("--model", default="yolov8n.pt", help="YOLOv8 *.pt (COCO)")
     ap.add_argument("--cams", default="cameraA=0,cameraB=1",
                     help='Comma list of logical ids: "cameraA=0,cameraB=1". Only the KEYS matter; sources are chosen at runtime by the UI.')
@@ -61,17 +53,32 @@ def parse_args():
     ap.add_argument("--overlap-thresh", type=float, default=0.05,
                     help="Min overlap ratio bbox∩zone / bbox area for --hit overlap.")
 
-    # ---- Face allowlist (ADDED) ----
-    ap.add_argument("--allowlist-dir", default=None,
-                    help="Folder of allowed persons’ face images. Filenames become display names, e.g., 'Alice.jpg'.")
-    ap.add_argument("--allow-thresh", type=float, default=0.35,
-                    help="Cosine similarity threshold (0–1) for allowlist face match.")
+    # ---- Face allowlist (OpenCV YuNet + SFace) ----
+    ap.add_argument("--allowlist-dir", default="./allowed_faces",
+                    help="Folder of allowed persons’ face images. Supports folders-per-person or single files.")
+    ap.add_argument("--allow-thresh", type=float, default=0.65,    # <— stricter default
+                    help="Cosine similarity threshold (0–1) for allowlist face match (SFace).")
     ap.add_argument("--allow-cache-sec", type=float, default=2.0,
                     help="Keep a short permit cache (seconds) after an allowed face is seen.")
+    ap.add_argument("--models-dir", default="./models",
+                    help="Directory containing YuNet and SFace ONNX files.")
+    ap.add_argument("--autodownload-models", action="store_true",
+                    help="If ONNX files are missing, download from OpenCV Zoo automatically.")
+
+    # ---- NEW strictness/quality controls ----
+    ap.add_argument("--strict", action="store_true",
+                    help="Require best score to beat second-best by a margin for acceptance.")
+    ap.add_argument("--margin", type=float, default=0.18,
+                    help="Required (best - second_best) margin when --strict is set.")
+    ap.add_argument("--min-face", type=int, default=80,
+                    help="Reject faces smaller than this width or height in pixels (reduces false accepts).")
+
     return ap.parse_args()
+
 
 ARGS = parse_args()
 
+# ---------------- Parse cameras ----------------
 def parse_cams(spec: str) -> Dict[str, str]:
     out = {}
     for token in spec.split(","):
@@ -87,7 +94,6 @@ def parse_cams(spec: str) -> Dict[str, str]:
         raise ValueError("No cameras parsed from --cams.")
     return out
 
-# Logical camera IDs (slots) from --cams keys
 CAM_IDS: List[str] = list(parse_cams(ARGS.cams).keys())
 
 # ---------------- Geometry helpers ----------------
@@ -115,7 +121,7 @@ subscribers: List[asyncio.Queue] = []
 
 # Worker registries
 workers_by_id: Dict[str, "CameraWorker"] = {}
-active_sources_by_id: Dict[str, int] = {}  # cam_id -> DS index (extend to RTSP if needed)
+active_sources_by_id: Dict[str, int] = {}  # cam_id -> index
 
 # --- COLORS ---
 ZONE_COLOR   = (255, 0, 0)   # BLUE (zone)
@@ -123,58 +129,251 @@ SAFE_COLOR   = (0, 255, 0)   # GREEN (person safe)
 ALERT_COLOR  = (0, 0, 255)   # RED   (person in zone)
 ALLOW_COLOR  = (255, 165, 0) # ORANGE (allowed in zone)
 
-# --------- Allowlist (face embeddings) ----------
-ALLOWLIST_DB: List[Tuple[str, np.ndarray]] = []  # [(name, embedding512)]
+# --------- Allowlist DB ----------
+ALLOWLIST_DB: List[Tuple[str, np.ndarray]] = []  # [(name, embeddingN)]
 ALLOWLIST_LOCK = threading.Lock()
 
 # Recent-permit cache (per-cam): [(ts, (cx,cy))]
 RECENT_ALLOW: Dict[str, List[Tuple[float, Tuple[int,int]]]] = {}
 RECENT_LOCK = threading.Lock()
 
-# ---------------- Devices (Windows) ----------------
+# --------- Model paths / autodownload ----------
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+SFACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+
+def ensure_models(models_dir: str) -> Tuple[str, str]:
+    os.makedirs(models_dir, exist_ok=True)
+    yunet = os.path.join(models_dir, "face_detection_yunet_2023mar.onnx")
+    sface = os.path.join(models_dir, "face_recognition_sface_2021dec.onnx")
+
+    missing = []
+    if not os.path.isfile(yunet): missing.append(("YuNet", yunet, YUNET_URL))
+    if not os.path.isfile(sface): missing.append(("SFace", sface, SFACE_URL))
+
+    if missing and getattr(ARGS, "autodownload_models", False):
+        for name, path, url in missing:
+            try:
+                print(f"[models] downloading {name} from {url} -> {path}")
+                urllib.request.urlretrieve(url, path)
+            except Exception as e:
+                print(f"[models] failed to download {name}: {e}")
+
+    for name, path, _ in [("YuNet", yunet, YUNET_URL), ("SFace", sface, SFACE_URL)]:
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                f"{name} ONNX not found at {path}. Place it there or run with --autodownload-models."
+            )
+    return yunet, sface
+
+# --------- OpenCV face stack ----------
+class FaceStack:
+    """
+    Thin wrapper around OpenCV YuNet (detector) + SFace (recognizer).
+    """
+    def __init__(self, yunet_path: str, sface_path: str):
+        self.detector = cv2.FaceDetectorYN_create(
+            model=yunet_path,
+            config="",
+            input_size=(320, 320),
+            score_threshold=0.6,
+            nms_threshold=0.3,
+            top_k=5000
+        )
+        self.recognizer = cv2.FaceRecognizerSF_create(sface_path, "")
+
+    def set_size(self, w: int, h: int):
+        self.detector.setInputSize((w, h))
+
+    def detect(self, bgr: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
+        try:
+            faces = self.detector.detect(bgr)
+        except cv2.error:
+            faces = None
+        if faces is None:
+            return []
+        dets = faces[1] if isinstance(faces, tuple) and len(faces) == 2 else faces
+        out = []
+        if dets is None:
+            return out
+        for det in dets:
+            x, y, w, h = det[:4]
+            score = det[-1] if det.shape[0] >= 15 else 1.0
+            out.append((int(x), int(y), int(x+w), int(y+h), float(score)))
+        return out
+
+    def embed(self, bgr: np.ndarray, box: Tuple[int,int,int,int]) -> Optional[np.ndarray]:
+        x1, y1, x2, y2 = box
+        face_box = np.array([x1, y1, x2 - x1, y2 - y1], dtype=np.int32)  # x,y,w,h
+        try:
+            aligned = self.recognizer.alignCrop(bgr, face_box)
+            feat = self.recognizer.feature(aligned)
+        except cv2.error:
+            return None
+        if feat is None:
+            return None
+        feat = feat.astype("float32").ravel()
+        n = np.linalg.norm(feat) + 1e-9
+        return feat / n
+
+# --------- Allowed faces utilities ----------
+def cosine_sim(a, b):
+    a = np.asarray(a, dtype="float32").ravel()
+    b = np.asarray(b, dtype="float32").ravel()
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
+    return float(np.dot(a, b) / denom)
+
+def _recent_permit(cam_id: str, cx: int, cy: int) -> bool:
+    with RECENT_LOCK:
+        arr = RECENT_ALLOW.get(cam_id, [])
+    now = time.time()
+    arr = [(ts, pt) for (ts, pt) in arr if now - ts <= ARGS.allow_cache_sec]
+    with RECENT_LOCK:
+        RECENT_ALLOW[cam_id] = arr
+    for _, (px, py) in arr:
+        if (px - cx) ** 2 + (py - cy) ** 2 <= (50 ** 2):
+            return True
+    return False
+
+def _add_recent_permit(cam_id: str, cx: int, cy: int):
+    with RECENT_LOCK:
+        arr = RECENT_ALLOW.get(cam_id, [])
+        arr.append((time.time(), (cx, cy)))
+        RECENT_ALLOW[cam_id] = arr
+
+def load_allowlist_embeddings(dirpath: str, face_stack: FaceStack) -> List[Tuple[str, np.ndarray]]:
+    if not dirpath or not os.path.isdir(dirpath):
+        print(f"[allow] directory not found: {dirpath}")
+        return []
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+    subdirs = [os.path.join(dirpath, d) for d in os.listdir(dirpath)
+               if os.path.isdir(os.path.join(dirpath, d))]
+    using_subdirs = len(subdirs) > 0
+
+    out: List[Tuple[str, np.ndarray]] = []
+
+    if using_subdirs:
+        print(f"[allow] using per-person folders under {dirpath}")
+        for person_dir in sorted(subdirs):
+            person = os.path.basename(person_dir).strip()
+            img_paths = []
+            for root, _, fns in os.walk(person_dir):
+                for fn in fns:
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        img_paths.append(os.path.join(root, fn))
+            if not img_paths:
+                print(f"[allow] {person}: no images")
+                continue
+
+            embs = []
+            for fp in img_paths:
+                img = cv2.imread(fp)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                face_stack.set_size(w, h)
+                dets = face_stack.detect(img)
+                if not dets:
+                    continue
+                dets.sort(key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+                box = dets[0][:4]
+                emb = face_stack.embed(img, box)
+                if emb is not None:
+                    embs.append(emb)
+
+            if not embs:
+                print(f"[allow] {person}: no usable faces")
+                continue
+
+            mean_emb = np.mean(np.stack(embs, axis=0), axis=0)
+            mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-9)
+            out.append((person, mean_emb))
+            print(f"[allow] added person '{person}' with {len(embs)} image(s)")
+    else:
+        files: List[str] = []
+        for root, _, fns in os.walk(dirpath):
+            for fn in fns:
+                if os.path.splitext(fn)[1].lower() in exts:
+                    files.append(os.path.join(root, fn))
+        for fp in sorted(files):
+            img = cv2.imread(fp)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            face_stack.set_size(w, h)
+            dets = face_stack.detect(img)
+            if not dets:
+                print(f"[allow] no face detected in {fp}")
+                continue
+            dets.sort(key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+            box = dets[0][:4]
+            emb = face_stack.embed(img, box)
+            if emb is None:
+                continue
+            name = os.path.splitext(os.path.basename(fp))[0]
+            out.append((name, emb))
+            print(f"[allow] added '{name}' from {os.path.basename(fp)}")
+    return out
+
+def match_allowlist(emb: np.ndarray, thresh: float) -> Tuple[bool, Optional[str], float]:
+    """
+    Strict matcher:
+      - score must be >= threshold
+      - if --strict is ON, best score must exceed the second-best by --margin
+    """
+    with ALLOWLIST_LOCK:
+        db = list(ALLOWLIST_DB)
+    if not db:
+        return (False, None, 0.0)
+
+    scores = []
+    for name, ref in db:
+        scores.append((name, cosine_sim(emb, ref)))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    best_name, best_score = scores[0]
+    second_best = scores[1][1] if len(scores) > 1 else -1.0
+
+    accepted = best_score >= thresh
+    if accepted and getattr(ARGS, "strict", False):
+        if best_score - second_best < getattr(ARGS, "margin", 0.18):
+            accepted = False
+
+    return (accepted, best_name if accepted else None, best_score)
+
+
+# ---------------- Devices (probe with OpenCV only) ----------------
 def _probe_opencv_indices(max_index: int = 10) -> List[dict]:
     """
-    Fallback: try indices 0..max_index-1 with DSHOW/MSMF and return those that open.
-    Produces names like 'Camera #0 (index 0)' if we cannot get a friendly name.
+    Probe indices 0..max_index-1 with several backends and a short warm-up.
     """
     out = []
     for i in range(max_index):
         opened = False
-        # Try DSHOW first (works well on many Windows setups), then MSMF, then default
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, 0):
+        for backend in (0, cv2.CAP_DSHOW, cv2.CAP_MSMF):   # CAP_ANY first
             cap = cv2.VideoCapture(i, backend) if backend != 0 else cv2.VideoCapture(i)
-            ok, _ = cap.read()
-            if cap.isOpened() and ok:
-                opened = True
+            if not cap.isOpened():
                 cap.release()
-                break
+                continue
+            ok = False
+            t0 = time.time()
+            while time.time() - t0 < 0.3:
+                r, _ = cap.read()
+                if r:
+                    ok = True
+                    break
+                time.sleep(0.02)
             cap.release()
+            if ok:
+                opened = True
+                break
         if opened:
             out.append({"index": i, "name": f"Camera #{i} (index {i})"})
     return out
 
 def list_local_cams() -> List[dict]:
-    """
-    Returns [{"index": int, "name": "..."}].
-    - On Windows, try pygrabber for friendly names.
-    - If pygrabber not available (or returns none), fall back to OpenCV probing.
-    - On other OS, use OpenCV probing directly.
-    """
-    # Prefer pygrabber friendly names on Windows
-    if platform.system() == "Windows" and FilterGraph is not None:
-        try:
-            g = FilterGraph()
-            names = g.get_input_devices()  # list[str]
-            devices = [{"index": i, "name": name} for i, name in enumerate(names)]
-            if devices:
-                return devices
-        except Exception as e:
-            print("[devices] pygrabber enumerate error:", e)
-
-    # Fallback: probe indices with OpenCV (works on all OSes)
-    devices = _probe_opencv_indices(max_index=10)
-    return devices
-
+    # Avoid COM/pygrabber instability; rely on OpenCV probing everywhere
+    return _probe_opencv_indices(max_index=10)
 
 # ---------------- Health ----------------
 @app.get("/health")
@@ -184,60 +383,61 @@ def health():
 # ---------------- API for React ----------------
 @app.get("/cam_ids")
 def cam_ids():
-    """Logical slots (from --cams keys)."""
     return {"cam_ids": CAM_IDS}
 
 @app.get("/devices")
 def devices():
-    """Physical camera devices (Windows)."""
     return {"devices": list_local_cams()}
 
 class ActivateMapBody(BaseModel):
-    # Example: {"cameraA": "Logitech HD Pro Webcam C920", "cameraB": "Integrated Camera"}
-    map: Dict[str, str]
+    map: Dict[str, str]  # {"cameraA": "Camera #0 (index 0)"} or {"cameraA": "0"}
+
+def _parse_index_from_label(label: str) -> Optional[int]:
+    label = str(label).strip()
+    if label.isdigit():
+        return int(label)
+    m = re.search(r"\(index\s+(\d+)\)", label)
+    if m:
+        return int(m.group(1))
+    try:
+        return int(label)
+    except Exception:
+        return None
 
 def stop_worker(cam_id: str):
     w = workers_by_id.pop(cam_id, None)
     if w:
-        w.stop_flag = True
+        w.stop()
         try: w.join(timeout=2.0)
         except: pass
     latest_jpeg[cam_id] = None
     active_sources_by_id.pop(cam_id, None)
 
-def start_worker(cam_id: str, src):
-    w = CameraWorker(cam_id, src, ARGS.model)
+def start_worker(cam_id: str, src_index: int):
+    w = CameraWorker(cam_id, src_index, ARGS.model)
     w.start()
     workers_by_id[cam_id] = w
-    active_sources_by_id[cam_id] = src
+    active_sources_by_id[cam_id] = src_index
     if cam_id not in latest_jpeg:
         latest_jpeg[cam_id] = None
 
 @app.post("/activate_map")
 def activate_map(body: ActivateMapBody):
-    """
-    Bind logical ids to device names; start/stop workers as needed.
-    """
-    devs = list_local_cams()
-    name_to_index = {d["name"]: d["index"] for d in devs}
-
-    # Build cam_id -> source mapping from names
     new_map: Dict[str, int] = {}
-    for cam_id, dev_name in body.map.items():
+    for cam_id, label in body.map.items():
         if cam_id not in CAM_IDS:
             raise HTTPException(400, f"Unknown cam id: {cam_id}")
-        if dev_name not in name_to_index:
-            raise HTTPException(400, f"Device not found: {dev_name}")
-        new_map[cam_id] = int(name_to_index[dev_name])
+        idx = _parse_index_from_label(label)
+        if idx is None:
+            raise HTTPException(400, f"Could not parse index from '{label}'. Use a number or the 'Camera #X (index X)' label.")
+        new_map[cam_id] = idx
 
     changed = []
-    # Stop cams not in the new map
     for cam_id in list(active_sources_by_id.keys()):
         if cam_id not in new_map:
             stop_worker(cam_id)
             changed.append(cam_id)
 
-    # Start/restart cams in the new map
     for cam_id, src in new_map.items():
         have = active_sources_by_id.get(cam_id)
         if have != src:
@@ -250,7 +450,6 @@ def activate_map(body: ActivateMapBody):
 
 @app.get("/cams")
 def list_cams():
-    """Currently active cams (workers running)."""
     return {"cams": list(active_sources_by_id.keys())}
 
 @app.get("/video")
@@ -376,215 +575,51 @@ def draw_zones_interactive(cam_id: str, cam_src):
         elif k==ord('q') or k==27: break
     cap.release(); cv2.destroyAllWindows()
 
-# ---------------- Face allowlist helpers (UPDATED) ----------------
-def _build_face_app():
-    """
-    Robust initializer that supports very old and newer insightface versions.
-    - Tries positional 'name' (old API) and keyword (newer).
-    - Does NOT pass 'providers' (since your build doesn't support it).
-    - Forces a writable INSIGHTFACE_HOME so models can download.
-    - Verifies a detection model actually exists; otherwise tries next pack.
-    """
-    packs = ["antelopev2", "antelope", "buffalo_l", "buffalo_m"]
-    root = _insightface_home()
-    last_err = None
-
-    for pack in packs:
-        try:
-            # Try old-style positional name first (your error shows this is required)
-            try:
-                fa = FaceAnalysis(pack, root=root)
-            except TypeError:
-                # Fallback: some versions expect keywords
-                fa = FaceAnalysis(name=pack, root=root)
-
-            # Old API: prepare(ctx_id=..., det_size=..., det_thresh=?)
-            # Do NOT pass providers (not supported in your build)
-            try:
-                fa.prepare(ctx_id=0, det_size=(256, 256))
-            except TypeError:
-                # Some very old builds use different arg order/names—retry minimal
-                fa.prepare(ctx_id=0)
-
-            # ---- verify detection actually loaded ----
-            has_det = False
-            if hasattr(fa, "models") and isinstance(getattr(fa, "models"), dict):
-                has_det = bool(fa.models.get("detection"))
-            if not has_det and hasattr(fa, "det_model"):
-                has_det = fa.det_model is not None
-
-            if has_det:
-                print(f"[face] initialized using pack='{pack}', cache='{root}'")
-                return fa
-            else:
-                print(f"[face] pack '{pack}' initialized but no detection model; trying next...")
-        except Exception as e:
-            last_err = e
-            print(f"[face] init failed for pack '{pack}': {repr(e)}")
-
-    print("[face] all packs failed; face allowlist disabled.")
-    if last_err:
-        print("[face] last error:", repr(last_err))
-    return None
-
-
-
-def _load_allowlist_embeddings(dirpath: str) -> List[Tuple[str, np.ndarray]]:
-    fa = _build_face_app()
-    if fa is None:
-        return []
-
-    exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-    files: List[str] = []
-    for root, _, fns in os.walk(dirpath):
-        for fn in fns:
-            if os.path.splitext(fn)[1].lower() in exts:
-                files.append(os.path.join(root, fn))
-
-    out: List[Tuple[str, np.ndarray]] = []
-    for fp in files:
-        img = cv2.imread(fp)
-        if img is None:
-            continue
-        faces = fa.get(img)
-        if not faces:
-            print(f"[allow] no face detected in {fp} (use a clear, front-facing photo)")
-            continue
-        else:
-            print(f"[allow] {fp}: detected {len(faces)} face(s)")
-        f = max(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]))
-        emb = getattr(f, "normed_embedding", None) or getattr(f, "embedding", None)
-        if emb is None:
-            continue
-        emb = emb.astype("float32")
-        emb = emb / (np.linalg.norm(emb) + 1e-9)
-        name = os.path.splitext(os.path.basename(fp))[0]
-        out.append((name, emb))
-        print(f"[allow] added {name} from {os.path.basename(fp)}")
-    return out
-
-def _match_allowlist(emb: np.ndarray, thresh: float) -> Tuple[bool, Optional[str], float]:
-    with ALLOWLIST_LOCK:
-        db = list(ALLOWLIST_DB)
-    if not db:
-        return (False, None, 0.0)
-    best_name, best_score = None, -1.0
-    for name, ref in db:
-        score = float(np.dot(emb, ref))  # cosine; embeddings normalized
-        if score > best_score:
-            best_score, best_name = score, name
-    return (best_score >= thresh, best_name if best_score >= thresh else best_name, best_score)
-
-def _extract_face_embedding(face_app: FaceAnalysis, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> Optional[np.ndarray]:
-    """
-    Top->bottom multi-region sweep over the full person bbox.
-    Returns normalized embedding or None.
-    """
-    h, w = frame.shape[:2]
-    x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w - 1, x2))
-    y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h - 1, y2))
-    if x2 <= x1 or y2 <= y1:
-        return None
-
-    H = y2 - y1
-    regions = [
-        (y1, y2),                                  # FULL
-        (y1, y1 + int(0.70 * H)),                  # TOP 70%
-        (y1 + int(0.20 * H), y1 + int(0.80 * H)),  # MIDDLE 60%
-        (y1 + int(0.40 * H), y2),                  # BOTTOM 60%
-    ]
-
-    best_face = None
-    best_area = -1
-    for (sy, ey) in regions:
-        crop = frame[sy:ey, x1:x2]
-        if crop.size == 0:
-            continue
-        ch, cw = crop.shape[:2]
-        scale = 640.0 / max(ch, cw) if max(ch, cw) > 640 else 1.0
-        crop_in = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else crop
-        faces = face_app.get(crop_in)
-        if not faces:
-            continue
-        f = max(faces, key=lambda x: (x.bbox[2]-x.bbox[0]) * (x.bbox[3]-x.bbox[1]))
-        area = (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])
-        if area > best_area:
-            best_area = area
-            best_face = f
-
-    if best_face is None:
-        return None
-    emb = getattr(best_face, "normed_embedding", None) or getattr(best_face, "embedding", None)
-    if emb is None:
-        return None
-    emb = emb.astype("float32")
-    emb = emb / (np.linalg.norm(emb) + 1e-9)
-    return emb
-
-def _recent_permit(cam_id: str, cx: int, cy: int) -> bool:
-    """Return True if a recent allowed bbox center is near (cx,cy)."""
-    with RECENT_LOCK:
-        arr = RECENT_ALLOW.get(cam_id, [])
-    now = time.time()
-    # purge old
-    arr = [(ts, pt) for (ts, pt) in arr if now - ts <= ARGS.allow_cache_sec]
-    with RECENT_LOCK:
-        RECENT_ALLOW[cam_id] = arr
-    # check proximity
-    for _, (px, py) in arr:
-        if (px - cx) ** 2 + (py - cy) ** 2 <= (50 ** 2):  # ~50px radius
-            return True
-    return False
-
-def _add_recent_permit(cam_id: str, cx: int, cy: int):
-    with RECENT_LOCK:
-        arr = RECENT_ALLOW.get(cam_id, [])
-        arr.append((time.time(), (cx, cy)))
-        RECENT_ALLOW[cam_id] = arr
-
-# ---------------- Management endpoints for allowlist (optional) ----------------
-@app.get("/allowlist")
-def allowlist_info():
-    with ALLOWLIST_LOCK:
-        names = [n for n, _ in ALLOWLIST_DB]
-    return {"count": len(names), "names": names, "threshold": ARGS.allow_thresh}
-
-@app.post("/reload_allowlist")
-def reload_allowlist():
-    if not ARGS.allowlist_dir or not os.path.isdir(ARGS.allowlist_dir):
-        raise HTTPException(400, "allowlist-dir not set or not a directory")
-    db = _load_allowlist_embeddings(ARGS.allowlist_dir)
-    with ALLOWLIST_LOCK:
-        ALLOWLIST_DB.clear()
-        ALLOWLIST_DB.extend(db)
-    return {"ok": True, "count": len(ALLOWLIST_DB)}
-
 # ---------------- Camera Worker ----------------
 class CameraWorker(threading.Thread):
-    def __init__(self, cam_id: str, cam_src, model_path: str):
+    def __init__(self, cam_id: str, cam_index: int, model_path: str):
         super().__init__(daemon=True)
         self.cam_id = cam_id
-        self.cam_src = cam_src
+        self.cam_index = cam_index
         self.model_path = model_path
         self.stop_flag = False
+
+        yunet, sface = ensure_models(ARGS.models_dir)
+        self.face_stack = FaceStack(yunet, sface)
+
+    def stop(self):
+        self.stop_flag = True
+
+    def _open_cap(self, index: int):
+        """Try several backends. Return opened cap or None."""
+        for backend in (0, cv2.CAP_DSHOW, cv2.CAP_MSMF):  # CAP_ANY first
+            cap = cv2.VideoCapture(index, backend) if backend != 0 else cv2.VideoCapture(index)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            # warm-up for up to 1s
+            ok = False
+            t0 = time.time()
+            while time.time() - t0 < 1.0:
+                r, _ = cap.read()
+                if r:
+                    ok = True
+                    break
+                time.sleep(0.02)
+            if ok:
+                return cap
+            cap.release()
+        return None
 
     def run(self):
         global latest_jpeg
 
-        def open_cap(src):
-            for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW, 0):
-                cap = cv2.VideoCapture(src, backend) if backend != 0 else cv2.VideoCapture(src)
-                ok, _ = cap.read()
-                if cap.isOpened() and ok:
-                    return cap
-                cap.release()
-            return None
-
-        probe = open_cap(self.cam_src)
+        # Probe once to get frame size
+        probe = self._open_cap(self.cam_index)
         if probe is None:
-            print(f"[{self.cam_id}] camera open/read failed"); return
+            print(f"[{self.cam_id}] camera open/read failed (index {self.cam_index})"); return
         ok, fr = probe.read()
-        if not ok:
+        if not ok or fr is None:
             print(f"[{self.cam_id}] camera read failed on probe"); probe.release(); return
         h, w = fr.shape[:2]; probe.release()
 
@@ -595,25 +630,30 @@ class CameraWorker(threading.Thread):
             print(f"[{self.cam_id}] {self.model_path} not found; using {model_file}")
         model = YOLO(model_file)
 
-        cap = open_cap(self.cam_src)
+        cap = self._open_cap(self.cam_index)
         if cap is None:
             print(f"[{self.cam_id}] cannot open cam again"); return
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
 
-        # ---- Face module (init once) ----
-        face_app = None
-        if ARGS.allowlist_dir:
-            face_app = _build_face_app()
-            if face_app is None:
-                print(f"[{self.cam_id}] face module not available; allowlist disabled")
-
         last_emit = 0.0
+        fail_reads = 0
+
         while not self.stop_flag:
             ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.02); continue
+            if not ok or frame is None:
+                fail_reads += 1
+                time.sleep(0.02)
+                if fail_reads > 50:  # ~1s of failures → reopen
+                    cap.release()
+                    cap = self._open_cap(self.cam_index)
+                    fail_reads = 0
+                    if cap is None:
+                        time.sleep(0.5)
+                continue
+            fail_reads = 0
 
+            # person detection
             res = model.predict(frame, imgsz=ARGS.imgsz, conf=ARGS.conf, classes=[0], verbose=False)
             boxes = res[0].boxes.xyxy.cpu().numpy() if len(res) else []
 
@@ -627,11 +667,14 @@ class CameraWorker(threading.Thread):
             triggered = False
             triggered_zone = None
 
+            # set YuNet size for this frame
+            H, W = frame.shape[:2]
+            self.face_stack.set_size(W, H)
+
             for b in boxes:
                 x1,y1,x2,y2 = map(int, b[:4])
                 in_zone = False
 
-                # representative points
                 px = int((x1+x2)//2)
                 py = int((y1+y2)//2)
 
@@ -659,25 +702,40 @@ class CameraWorker(threading.Thread):
                         if ratio >= ARGS.overlap_thresh:
                             in_zone = True; triggered_zone = z; break
 
-                # ---- Face allowlist check ----
                 allowed_name, allowed_score = None, 0.0
-                if in_zone:
-                    # quick cache to avoid flicker if face is briefly missed
-                    if _recent_permit(self.cam_id, px, py):
-                        allowed_name, allowed_score = "(recent)", 1.0
-                    elif face_app:
-                        emb = _extract_face_embedding(face_app, frame, x1, y1, x2, y2)
-                        if emb is not None:
-                            is_allowed, nm, sc = _match_allowlist(emb, ARGS.allow_thresh)
-                            if is_allowed:
-                                allowed_name, allowed_score = nm, sc
-                                _add_recent_permit(self.cam_id, px, py)
+                if in_zone and (len(ALLOWLIST_DB) > 0):
+                    # run face detector inside the person box (expand slightly)
+                    x1c = max(0, x1-10); y1c = max(0, y1-20)
+                    x2c = min(W-1, x2+10); y2c = min(H-1, y2+10)
+                    crop = frame[y1c:y2c, x1c:x2c]
+                    if crop.size > 0:
+                        self.face_stack.set_size(x2c - x1c, y2c - y1c)
+                        dets = self.face_stack.detect(crop)
+                        dets_full = []
+                        for (fx1, fy1, fx2, fy2, sc) in dets:
+                            dets_full.append((fx1+x1c, fy1+y1c, fx2+x1c, fy2+y1c, sc))
+                        if dets_full:
+                            dets_full.sort(key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+                            fbox = dets_full[0][:4]
+                            fx1, fy1, fx2, fy2 = fbox
+                            # Enforce a minimum face size to avoid noisy, tiny detections
+                            if (fx2 - fx1) < ARGS.min_face or (fy2 - fy1) < ARGS.min_face:
+                                emb = None
+                            else:
+                                emb = self.face_stack.embed(frame, fbox)
 
-                # decide color/state
+                            if emb is not None:
+                                is_allowed, nm, sc = match_allowlist(emb, ARGS.allow_thresh)
+                                if is_allowed:
+                                    allowed_name, allowed_score = nm, sc
+                                    _add_recent_permit(self.cam_id, px, py)
+                        else:
+                            if _recent_permit(self.cam_id, px, py):
+                                allowed_name, allowed_score = "(recent)", 1.0
+
                 if in_zone:
-                    if allowed_name:  # allowed person in zone → NO alert
+                    if allowed_name:
                         color = ALLOW_COLOR
-                        # small band label for clarity
                         band_y1 = max(0, y1 - 24)
                         cv2.rectangle(vis, (x1, band_y1), (x2, y1), ALLOW_COLOR, -1)
                         label = f"ALLOWED: {allowed_name}" + (f" ({allowed_score:.2f})" if allowed_name != "(recent)" else "")
@@ -693,7 +751,6 @@ class CameraWorker(threading.Thread):
                 if ARGS.hit in ("feet","center"):
                     cv2.circle(vis,(px, py if ARGS.hit=="center" else y2),4,color,-1)
 
-            # emit banner + event only when triggered and NOT allowed
             if triggered:
                 cv2.rectangle(vis, (0,0), (vis.shape[1], 48), ALERT_COLOR, -1)
                 cv2.putText(vis, f"ALERT: {self.cam_id} PERSON IN RESTRICTED ZONE", (12,32),
@@ -714,39 +771,47 @@ class CameraWorker(threading.Thread):
 
         cap.release()
 
-# ---- InsightFace cache helper (ADD THIS) ----
-def _insightface_home() -> str:
-    """
-    Returns a writable directory to cache/download InsightFace models.
-    Uses INSIGHTFACE_HOME if set; otherwise creates ./.insightface next to this file.
-    """
-    home = os.environ.get("INSIGHTFACE_HOME")
-    if not home:
-        home = os.path.join(os.path.dirname(__file__), ".insightface")
-    os.makedirs(home, exist_ok=True)
-    return home
-    
+# ---------------- Allowlist endpoints ----------------
+@app.get("/allowlist")
+def allowlist_info():
+    with ALLOWLIST_LOCK:
+        names = [n for n, _ in ALLOWLIST_DB]
+    return {"count": len(names), "names": names, "threshold": ARGS.allow_thresh}
+
+@app.post("/reload_allowlist")
+def reload_allowlist():
+    try:
+        yunet, sface = ensure_models(ARGS.models_dir)
+        face_stack = FaceStack(yunet, sface)
+        db = load_allowlist_embeddings(ARGS.allowlist_dir, face_stack)
+        with ALLOWLIST_LOCK:
+            ALLOWLIST_DB.clear()
+            ALLOWLIST_DB.extend(db)
+        return {"ok": True, "count": len(ALLOWLIST_DB)}
+    except Exception as e:
+        raise HTTPException(500, f"reload failed: {e}")
+
 # ---------------- Lifespan ----------------
 @app.on_event("startup")
 async def on_startup():
     app.state.loop = asyncio.get_event_loop()
-    if ARGS.allowlist_dir and os.path.isdir(ARGS.allowlist_dir):
-        try:
-            db = _load_allowlist_embeddings(ARGS.allowlist_dir)
+    try:
+        yunet, sface = ensure_models(ARGS.models_dir)
+        face_stack = FaceStack(yunet, sface)
+        if ARGS.allowlist_dir and os.path.isdir(ARGS.allowlist_dir):
+            db = load_allowlist_embeddings(ARGS.allowlist_dir, face_stack)
             with ALLOWLIST_LOCK:
                 ALLOWLIST_DB.clear()
                 ALLOWLIST_DB.extend(db)
             print(f"[allow] loaded {len(ALLOWLIST_DB)} allowed face(s) from {ARGS.allowlist_dir}")
-        except Exception as e:
-            print(f"[allow] failed to load allowlist: {repr(e)}")
-            print("[allow] continuing without face allowlist.")
-    elif ARGS.allowlist_dir:
-        print(f"[allow] directory not found: {ARGS.allowlist_dir}")
-
+        else:
+            print(f"[allow] directory not found or not set: {ARGS.allowlist_dir}")
+    except Exception as e:
+        print(f"[startup] model init/allowlist failed: {e}")
+        print("[startup] continuing without allowlist.")
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    # Zone drawer for one cam index (utility) — here we still use a raw index
     if ARGS.draw_zones:
         if not ARGS.cam_id or ARGS.cam_id not in CAM_IDS:
             print("When using --draw-zones, also provide --cam-id that exists in --cams.")
@@ -755,5 +820,4 @@ if __name__ == "__main__":
         draw_zones_interactive(ARGS.cam_id, 0)
         raise SystemExit(0)
 
-    # Start ONLY the web server; workers are started via POST /activate_map
     uvicorn.run(app, host=ARGS.host, port=ARGS.port, log_level="info")
